@@ -1,0 +1,44 @@
+name: IPA para sideload
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ipa:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Elegir el Xcode 26 más nuevo
+        run: |
+          ls -d /Applications/Xcode*.app
+          XC=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+      # Sin firmar: Sideloadly/AltStore firman con el Apple ID de quien instala.
+      # Cuentas administradas y Sign in with Apple/Google apagados: no andan con
+      # una cuenta gratuita y la app se usa con la API key propia.
+      - name: Compilar
+        run: |
+          xcodebuild -project apps/ios/Mural.xcodeproj -scheme Mural \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            MURAL_MANAGED_ACCOUNTS_ENABLED=NO MURAL_GOOGLE_SIGN_IN_ENABLED=NO \
+            MURAL_APPLE_SIGN_IN_ENABLED=NO MURAL_APPLE_SWIFT_FLAGS= MURAL_APPLE_ENTITLEMENTS= \
+            build
+      - name: Empaquetar IPA
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/Mural.app Payload/
+          zip -qry Mural.ipa Payload
+          ls -la Mural.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Mural-ipa
+          path: Mural.ipa
+          retention-days: 30
