@@ -258,9 +258,10 @@ class CaptionParityTest {
         compose.onNodeWithTag("word-lookup-close").performClick(); pause()
     }
 
-    @Test fun allEightLanguagesSendTheTappedWordWithItsOriginalSentence() {
+    @Test fun everyLanguageSendsTheTappedWordWithItsOriginalSentence() {
         val samples = listOf(
             Triple("nb", "Jeg vil ha kaffe.", "kaffe"), Triple("es", "Quiero un café.", "café"),
+            Triple("es-AR", "¿Querés un cortado?", "cortado"),
             Triple("en", "I would like coffee.", "coffee"), Triple("fr", "Je voudrais du café.", "café"),
             Triple("de", "Ich möchte Kaffee.", "Kaffee"), Triple("it", "Vorrei un caffè.", "caffè"),
             Triple("pt", "Quero um café.", "café"), Triple("zh", "我想去银行。", "银行"))
@@ -278,6 +279,7 @@ class CaptionParityTest {
             "nb" to listOf("Hygg", "elig! Jeg liker fri", "luftsliv."),
             "en" to listOf("That is inter", "esting."),
             "es" to listOf("Me gusta apren", "der espa", "ñol."),
+            "es-AR" to listOf("¿Vos también ten", "és ganas de sa", "lir?"),
             "fr" to listOf("Aujourd", "’hui, c’est inté", "ressant."),
             "de" to listOf("Das ist eine Sprach", "lern", "anwendung."),
             "it" to listOf("È una conver", "sazione interes", "sante."),
