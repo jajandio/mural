@@ -49,7 +49,7 @@ test('hosted admission accepts every locale shipped by Android and iOS', async (
   const swift = await Promise.all((await readdir(directory)).filter(name => name.endsWith('.swift'))
     .map(name => readFile(new URL(name, directory), 'utf8')));
   const iosLocales = swift.flatMap(source => [...source.matchAll(/locale: "([^"\n]+)"/g)].map(match => match[1]!)).sort();
-  assert.equal(androidLocales.length, 11);
+  assert.equal(androidLocales.length, 12);
   assert.deepEqual(androidLocales, iosLocales);
   for (const locale of androidLocales) assert.equal(supportsLanguage(locale), true, `Native locale rejected: ${locale}`);
   assert.equal(supportsLanguage('en-US'), true, 'Preserve existing client compatibility');
