@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypt
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from 'jose';
 import { transaction, type Database } from './db.js';
 import { ServiceError } from './errors.js';
-import { lockWallet } from './ledger.js';
+import { appendEntry,lockWallet } from './ledger.js';
 import type { PoolClient } from 'pg';
 import { appendMinuteEntry, captureWelcomeOffer } from './minutes.js';
 
@@ -53,6 +53,36 @@ export async function createChallenge(db: Database) {
   const id = randomUUID(), nonce = randomBytes(32).toString('hex');
   await db.query("INSERT INTO auth_challenges(id,nonce_hash,expires_at) VALUES($1,$2,now()+interval '5 minutes')", [id, digest(nonce)]);
   return { challengeID: id, nonce, expiresInSeconds: 300 };
+}
+/** Both proofs are fresh and nonce-bound; an email address is never an account join key. */
+export async function connectGoogleIdentity(db: Database, authorization: string | undefined,
+  proofs: {appleChallengeID:string;appleToken:string;googleChallengeID:string;googleToken:string},
+  config:AuthConfig,verify:typeof verifyIdentity=verifyIdentity) {
+  const account=await authenticate(db,authorization);
+  if(proofs.appleChallengeID===proofs.googleChallengeID) throw new ServiceError('invalid_challenge',401);
+  const challenges=(await db.query('SELECT id,nonce_hash FROM auth_challenges WHERE id=ANY($1::uuid[]) AND expires_at>now() AND used_at IS NULL',
+    [[proofs.appleChallengeID,proofs.googleChallengeID]])).rows;
+  if(challenges.length!==2) throw new ServiceError('invalid_challenge',401);
+  const apple=await verify('apple',proofs.appleToken,challenges.find(c=>c.id===proofs.appleChallengeID)?.nonce_hash,config);
+  const google=await verify('google',proofs.googleToken,challenges.find(c=>c.id===proofs.googleChallengeID)?.nonce_hash,config);
+  if(apple.provider!=='apple' || google.provider!=='google') throw new ServiceError('invalid_identity_token',401);
+  return transaction(db,async sql=>{
+    for(const id of [proofs.appleChallengeID,proofs.googleChallengeID].sort()) {
+      const consumed=await sql.query('UPDATE auth_challenges SET used_at=now() WHERE id=$1 AND used_at IS NULL AND expires_at>now() RETURNING id',[id]);
+      if(!consumed.rowCount) throw new ServiceError('invalid_challenge',401);
+    }
+    // Same ordering as signup prevents a concurrent Google signup from stealing the link.
+    await sql.query('SELECT pg_advisory_xact_lock(hashtext($1))',[`google:${google.subject}`]);
+    await lockWallet(sql,account,true,true);await assertSession(sql,account,authorization!);
+    const source=(await sql.query("SELECT account_id FROM identities WHERE provider='apple' AND subject=$1",[apple.subject])).rows[0];
+    if(source?.account_id!==account) throw new ServiceError('same_account_required',409);
+    const target=(await sql.query("SELECT account_id FROM identities WHERE provider='google' AND subject=$1",[google.subject])).rows[0];
+    if(target && target.account_id!==account) throw new ServiceError('identity_link_conflict',409);
+    const existing=(await sql.query("SELECT subject FROM identities WHERE provider='google' AND account_id=$1",[account])).rows[0];
+    if(existing && existing.subject!==google.subject) throw new ServiceError('identity_link_conflict',409);
+    if(!target) await sql.query("INSERT INTO identities(provider,subject,account_id) VALUES('google',$1,$2)",[google.subject,account]);
+    return {accountID:account,connected:true};
+  });
 }
 export async function exchangeIdentity(db: Database, provider: Provider, token: string, challengeID: string, config: AuthConfig,
   verify: typeof verifyIdentity = verifyIdentity, expectedAccountID?: string) {
@@ -126,23 +156,34 @@ export async function pruneAuthenticationRecords(db: Database): Promise<void> {
 }
 
 export interface AppleRevoker { revoke(accountID: string, freshAuthorizationCode: string, lockedAppleSubject?: string): Promise<void> }
-export async function deleteAccount(db: Database, account: string, appleRevoker?: AppleRevoker, authorizationCode?: string, authorization?: string) {
+export async function deleteAccount(db: Database, account: string, appleRevoker?: AppleRevoker, authorizationCode?: string,
+  authorization?: string, now = new Date(), playNotificationsOperational = false) {
   return transaction(db, async sql => {
     const wallet = await lockWallet(sql, account, true);
     if (authorization) await assertSession(sql, account, authorization);
     const pending = (await sql.query("SELECT id FROM checkout_orders WHERE account_id=$1 AND state='created' LIMIT 1", [account])).rowCount;
+    const verifiedAppleTestOnly=wallet.cashProvenanceVerified && (await sql.query(`SELECT 1 FROM ai_value_purchase_transactions
+      WHERE account_id=$1 AND provider='apple' AND environment='test' AND state='purchased' AND granted_nano>0
+      AND NOT EXISTS(SELECT 1 FROM ledger l WHERE l.account_id=$1 AND l.kind='purchase' AND l.sandbox_delta_nano>0
+        AND l.reference NOT LIKE 'ai-purchase:%')
+      AND NOT EXISTS(SELECT 1 FROM ai_value_purchase_transactions p WHERE p.account_id=$1 AND p.environment='test' AND p.provider<>'apple') LIMIT 1`,[account])).rowCount;
     // The foundation has no refund/checkout-expiry workflow yet. Do not orphan paid value.
-    if (pending || wallet.balance !== 0n || wallet.reserved !== 0n) throw new ServiceError('unresolved_billing', 409);
+    if (pending || wallet.balance-wallet.sandboxBalance !== 0n || wallet.reserved !== 0n ||
+      (wallet.sandboxBalance!==0n && !verifiedAppleTestOnly)) throw new ServiceError('unresolved_billing', 409);
     const minutes = (await sql.query('SELECT balance_ms,reserved_ms FROM minute_wallets WHERE account_id=$1', [account])).rows[0];
     const minutePurchase = (await sql.query("SELECT 1 FROM minute_entries WHERE account_id=$1 AND kind='purchase' LIMIT 1", [account])).rowCount;
     // The account lock serializes deletion with order creation, fulfillment and refund recovery.
-    // A missing transaction is an unpaid/uncertain order, not evidence that no charge can arrive.
+    // An operational private Play subscriber can recover a late token after deletion.
+    // If it is absent or unhealthy, keep the authenticated recovery path available.
     const unresolvedMinuteOrder = (await sql.query(`SELECT 1 FROM minute_purchase_orders o
       LEFT JOIN minute_purchase_transactions p ON p.order_id=o.id WHERE o.account_id=$1 AND o.entitlement_kind='minutes'
-      AND (p.order_id IS NULL OR p.state='pending' OR p.recovered_ms<LEAST(p.reversal_target_ms,p.granted_ms)) LIMIT 1`, [account])).rowCount;
+      AND ((p.order_id IS NULL AND (((o.provider='play' AND NOT $3::boolean) OR o.created_at>$2::timestamptz-interval '24 hours') OR
+        EXISTS(SELECT 1 FROM minute_provider_receipts r WHERE r.order_id=o.id))) OR p.state='pending'
+        OR p.recovered_ms<LEAST(p.reversal_target_ms,p.granted_ms)) LIMIT 1`, [account, now, playNotificationsOperational])).rowCount;
     const unresolvedValueOrder = (await sql.query(`SELECT 1 FROM minute_purchase_orders o
-      LEFT JOIN ai_value_purchase_transactions p ON p.order_id=o.id WHERE o.account_id=$1 AND o.entitlement_kind='ai_value'
-      AND (p.order_id IS NULL OR p.state='pending') LIMIT 1`, [account])).rowCount;
+      LEFT JOIN ai_value_purchase_transactions p ON p.order_id=o.id WHERE o.account_id=$1 AND (o.environment='live' OR o.provider<>'apple') AND o.entitlement_kind='ai_value'
+      AND ((p.order_id IS NULL AND (((o.provider='play' AND NOT $3::boolean) OR o.created_at>$2::timestamptz-interval '24 hours') OR
+        EXISTS(SELECT 1 FROM minute_provider_receipts r WHERE r.order_id=o.id))) OR p.state='pending') LIMIT 1`, [account, now, playNotificationsOperational])).rowCount;
     if (unresolvedMinuteOrder || unresolvedValueOrder || Number(minutes?.reserved_ms ?? 0) > 0 || (minutePurchase && Number(minutes?.balance_ms ?? 0) > 0))
       throw new ServiceError('unresolved_billing', 409);
     const apple = (await sql.query("SELECT subject FROM identities WHERE account_id=$1 AND provider='apple'", [account])).rows[0];
@@ -150,6 +191,9 @@ export async function deleteAccount(db: Database, account: string, appleRevoker?
       if (!appleRevoker || !authorizationCode) throw new ServiceError('apple_revocation_not_configured', 503);
       await appleRevoker.revoke(account, authorizationCode, apple.subject);
     }
+    // Unused verified sandbox value is free test credit, not customer cash.
+    // Keep orders/receipts on the tombstone for late notifications and refunds.
+    if(wallet.sandboxBalance>0n)await appendEntry(sql,account,`sandbox-deletion:${account}`,'reversal',-wallet.sandboxBalance,0n,null,-wallet.sandboxBalance);
     await sql.query('DELETE FROM identities WHERE account_id=$1', [account]);
     await sql.query('DELETE FROM auth_sessions WHERE account_id=$1', [account]);
     // Unused promotional time is forfeited on deletion; it must not trap a free account.
@@ -159,6 +203,7 @@ export async function deleteAccount(db: Database, account: string, appleRevoker?
       UNION ALL SELECT 1 FROM checkout_orders WHERE account_id=$1 UNION ALL SELECT 1 FROM usage_records WHERE account_id=$1
       UNION ALL SELECT 1 FROM hosted_sessions WHERE account_id=$1 UNION ALL SELECT 1 FROM minute_entries WHERE account_id=$1
       UNION ALL SELECT 1 FROM minute_purchase_orders WHERE account_id=$1
+      UNION ALL SELECT 1 FROM hosted_close_intents WHERE account_id=$1
       UNION ALL SELECT 1 FROM minute_campaign_recipients WHERE account_id=$1
       UNION ALL SELECT 1 FROM minute_guest_links WHERE member_account_id=$1 OR guest_account_id=$1
       UNION ALL SELECT 1 FROM minute_guest_link_intents WHERE member_account_id=$1 OR guest_account_id=$1 LIMIT 1`, [account]);

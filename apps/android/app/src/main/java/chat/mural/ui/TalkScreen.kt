@@ -35,6 +35,10 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -78,10 +82,12 @@ import chat.mural.core.SessionRecord
 import chat.mural.core.Speaker
 import chat.mural.core.ConversationProvider
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TalkScreen(
     vm: MuralViewModel,
     onOpenAdvanced: () -> Unit = {},
+    onOpenAccount: () -> Unit = {},
     microphoneMessage: String?,
     onMicrophone: () -> Unit,
     onOpenAppSettings: (() -> Unit)?,
@@ -90,6 +96,10 @@ fun TalkScreen(
     onHelp: () -> Unit,
 ) {
     var typing by rememberSaveable { mutableStateOf(false) }
+    var conversationChoice by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(vm.hasContinuation, vm.session?.id) {
+        if (vm.hasContinuation && !vm.isRunning) conversationChoice = true
+    }
     var lookup by rememberSaveable { mutableStateOf(false) }
     var lookupWord by rememberSaveable { mutableStateOf("") }
     var lookupSentence by rememberSaveable { mutableStateOf("") }
@@ -105,14 +115,16 @@ fun TalkScreen(
     BoxWithConstraints(Modifier.fillMaxSize().testTag("talk-screen")) {
     val scrollPage = LocalDensity.current.fontScale > 1.3f || maxHeight < 480.dp
     val compact = !scrollPage && maxHeight < 620.dp
+    val hasMandarinReading = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+        vm.language.id == "zh" && chat.mural.core.MandarinPinyin.containsHan(caption)
+    val compactReading = compact && hasMandarinReading
     val captionWidth = with(LocalDensity.current) { (maxWidth - 56.dp).roundToPx().coerceAtLeast(1) }
     val longPassage = passage != null && !scrollPage && textMeasurer.measure(
         caption, style = MaterialTheme.typography.headlineSmall,
         constraints = Constraints(maxWidth = captionWidth),
     ).lineCount > 2
     val readingSpace by animateFloatAsState(
-        if (longPassage || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
-            vm.language.id == "zh" && chat.mural.core.MandarinPinyin.containsHan(caption))) 1f else 0f, spring(dampingRatio = 1f, stiffness = 260f), label = "passage reading space",
+        if (longPassage || hasMandarinReading) 1f else 0f, spring(dampingRatio = 1f, stiffness = 260f), label = "passage reading space",
     )
     val orbSize = when {
         scrollPage -> 170.dp
@@ -133,15 +145,19 @@ fun TalkScreen(
                 style = MaterialTheme.typography.labelMedium, color = MuralColors.Secondary,
             )
         }
-        Spacer(Modifier.height(if (compact) 8.dp else 24.dp - 16.dp * readingSpace))
+        Spacer(Modifier.height(if (compactReading) 4.dp else if (compact) 8.dp else 24.dp - 16.dp * readingSpace))
         MuralOrb(
             energy = maxOf(vm.outputLevel.toFloat(), vm.inputLevel.toFloat() * .45f),
             listening = vm.state == "active" && vm.isVoiceSession && !vm.isMuted,
             active = vm.state != "closing",
             modifier = Modifier.size(orbSize).testTag("talk-orb"),
         )
-        Box(Modifier.fillMaxWidth().padding(top = if (compact) 8.dp else 12.dp).heightIn(min = 40.dp), contentAlignment = Alignment.Center) {
-            val status = statusText(vm.state, vm.isMuted, vm.isVoiceSession, vm.inactivitySeconds)
+        Box(Modifier.fillMaxWidth().padding(top = if (compactReading) 0.dp else if (compact) 8.dp else 12.dp)
+            .heightIn(min = if (compactReading) 24.dp else 40.dp), contentAlignment = Alignment.Center) {
+            val status = if (vm.hasContinuation) {
+                stringResource(if (vm.continuationReady) R.string.talk_status_continue_ready
+                    else if (vm.continuationNeedsMinutes) R.string.talk_status_continue_saved else R.string.talk_status_continue_settling)
+            } else statusText(vm.state, vm.isMuted, vm.isVoiceSession, vm.inactivitySeconds)
             val statusCaption = buildAnnotatedString {
                 if (vm.inactivitySeconds != null) {
                     withStyle(SpanStyle(fontWeight = FontWeight.Medium, fontFeatureSettings = "tnum")) { append(status.substringBefore('\n')) }
@@ -160,7 +176,7 @@ fun TalkScreen(
                 }
             }
         }
-        Spacer(Modifier.height(if (compact) 12.dp else 20.dp - 8.dp * readingSpace))
+        Spacer(Modifier.height(if (compactReading) 0.dp else if (compact) 12.dp else 20.dp - 8.dp * readingSpace))
         Column(
             // Each language keeps a share of the available space. A single scroller let
             // long target-language replies push their meaning entirely below the viewport.
@@ -170,7 +186,7 @@ fun TalkScreen(
             verticalArrangement = Arrangement.Center,
         ) {
         Column(
-            modifier = (if (scrollPage || passage == null) Modifier else Modifier.weight(1f, fill = false).passageScroll(targetScroll))
+            modifier = (if (scrollPage || passage == null) Modifier else Modifier.weight(if (compactReading) 3f else 1f, fill = false).passageScroll(targetScroll))
                 .fillMaxWidth().testTag("target-passage-scroll"),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
@@ -228,7 +244,7 @@ fun TalkScreen(
                 Text(stringResource(R.string.talk_checking), style = MaterialTheme.typography.bodySmall, color = MuralColors.Secondary)
             }
         }
-        Spacer(Modifier.height(when { scrollPage -> 28.dp; compact -> 10.dp; else -> 24.dp }))
+        Spacer(Modifier.height(when { scrollPage -> 28.dp; compactReading -> 0.dp; compact -> 10.dp; else -> 24.dp }))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
             RoundAction(MuralSymbol.Captions, stringResource(R.string.talk_meaning_label),
                 selected = vm.archive.preferences.meaningVisible, onClick = vm::toggleMeaning)
@@ -245,7 +261,9 @@ fun TalkScreen(
                 .background(Brush.linearGradient(listOf(Color(0xFFFFBA7A), MuralColors.Orange)), CircleShape).clip(CircleShape)
                 .testTag("start-conversation").semantics { contentDescription = micDescription }
                 .clickable(enabled = micEnabled, role = Role.Button) {
-                    if (vm.state == "active" && vm.isVoiceSession) vm.toggleMute() else onMicrophone()
+                    if (vm.state == "active" && vm.isVoiceSession) vm.toggleMute()
+                    else if (vm.hasContinuation) conversationChoice = true
+                    else onMicrophone()
                 }, contentAlignment = Alignment.Center) {
                 if (busy) CircularProgressIndicator(Modifier.size(25.dp), color = MuralColors.Ink, strokeWidth = 2.dp)
                 else MuralIcon(if (vm.isMuted && vm.state == "active") MuralSymbol.MicOff else MuralSymbol.Mic,
@@ -278,14 +296,35 @@ fun TalkScreen(
             Text(it, color = MuralColors.Secondary, textAlign = TextAlign.Center, style = MaterialTheme.typography.bodySmall)
             if (onOpenAppSettings != null) MuralTextButton(onClick = onOpenAppSettings) { Text(stringResource(R.string.talk_open_phone_settings)) }
         }
-        vm.notice?.let { Text(it, color = MuralColors.Secondary, textAlign = TextAlign.Center, style = MaterialTheme.typography.bodySmall) }
-        if (vm.session != null && !vm.isRunning) {
-            MuralTextButton(onClick = vm::resetConversation) { Text(stringResource(R.string.talk_new_conversation_button)) }
-        }
+        if (!vm.hasContinuation) vm.notice?.let { Text(it, color = MuralColors.Secondary, textAlign = TextAlign.Center, style = MaterialTheme.typography.bodySmall) }
         Spacer(Modifier.height(if (compact) 8.dp else 16.dp))
     }
     }
 
+    if (conversationChoice && vm.hasContinuation && !vm.isRunning) {
+        ModalBottomSheet(onDismissRequest = { conversationChoice = false }, containerColor = MuralColors.Cream,
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+            Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp)
+                .testTag("conversation-continuation-sheet"), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(stringResource(R.string.talk_continue_sheet_title), Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
+                    MuralTextButton(onClick = { conversationChoice = false }) { Text(stringResource(R.string.settings_done)) }
+                }
+                Text(vm.notice ?: stringResource(R.string.notice_continue_settling), color = MuralColors.Secondary,
+                    style = MaterialTheme.typography.bodyMedium)
+                Button(onClick = { conversationChoice = false; if (vm.continuationNeedsMinutes) onOpenAccount() else onMicrophone() },
+                    enabled = vm.continuationReady || vm.continuationNeedsMinutes,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = MuralColors.Orange, contentColor = MuralColors.Ink)) {
+                    Text(stringResource(if (vm.continuationNeedsMinutes) R.string.talk_continue_add_minutes
+                        else R.string.talk_continue_conversation_button), textAlign = TextAlign.Center)
+                }
+                MuralTextButton(onClick = { conversationChoice = false; vm.resetConversation() }, modifier = Modifier.fillMaxWidth()) {
+                    Text(stringResource(R.string.talk_new_conversation_button))
+                }
+            }
+        }
+    }
     if (typing) TypedReplySheet(vm.language.name, vm.working, onSendTyped, onDismiss = { typing = false },
         error = vm.typedReplyError, completedSends = vm.typedRepliesSent, onOpen = { vm.clearTypedReplyError(); vm.noteTypingActivity() }, onTyping = vm::noteTypingActivity)
     if (lookup) WordLookupSheet(lookupWord, lookupSentence, vm.language.id, vm.lookupResult, vm.lookupError, vm.lookupLoading,

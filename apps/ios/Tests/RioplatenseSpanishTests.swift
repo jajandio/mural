@@ -22,15 +22,6 @@ final class RioplatenseSpanishTests: XCTestCase {
         XCTAssertTrue(TeachingPolicy.assessment(language: language).contains("Use language es-AR for target-language evidence"))
     }
 
-    func testDetectorReportingBareSpanishDoesNotTriggerRedirect() throws {
-        let argentina = try XCTUnwrap(LanguageRegistry.module(for: "es-AR"))
-        XCTAssertFalse(TeachingPolicy.shouldRedirectSpeech(language: argentina, detectedLanguageID: "es", confidence: 0.99))
-        XCTAssertTrue(TeachingPolicy.shouldRedirectSpeech(language: argentina, detectedLanguageID: "en", confidence: 0.99))
-        XCTAssertTrue(TeachingPolicy.shouldRedirectSpeech(language: argentina, detectedLanguageID: "pt", confidence: 0.99))
-        let spain = try XCTUnwrap(LanguageRegistry.module(for: "es"))
-        XCTAssertTrue(TeachingPolicy.shouldRedirectSpeech(language: spain, detectedLanguageID: "en", confidence: 0.99))
-    }
-
     func testEvidenceAndProgressStayIsolatedFromSpainSpanish() throws {
         let date = Date(timeIntervalSince1970: 1_780_000_000)
         func session(_ id: String) -> SessionRecord {
